@@ -1,0 +1,234 @@
+#!/appl/livebox/python/bin/python
+
+import sys
+import requests
+import json
+import re
+import logging
+import pathlib
+import configparser
+import argparse
+
+from lbws import Lbws
+
+def is_ip(ip):
+    regex = '''^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$'''
+    if(re.search(regex, ip)):  
+        return True
+    else:  
+        return False
+
+def check_config(cfg):
+    log = logging.getLogger()
+    ret = True
+    cfg_def = {}
+    cfg_def['livebox'] = ['url', 'user', 'password']
+    cfg_def['gandi'] = ['key', 'domain', 'record_name', 'record_type']
+    for section in cfg_def.keys():
+        if not cfg.has_section(section):
+            log.error('Missing section {} in config file'.format(section))
+            ret = False
+        for option in cfg_def[section]:
+            if not cfg.has_option(section, option):
+                log.error('Missing option {} in section {} in config file'.format(option, section))
+                ret = False
+
+    return ret
+
+def init_logger(log_file, log_level):
+    log = logging.getLogger()
+    logFormatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    try:
+        log.setLevel(log_level.upper())
+    except ValueError:
+        log.setLevel(logging.INFO)
+
+    fileHandler = logging.FileHandler(str(log_file))
+    fileHandler.setFormatter(logFormatter)
+    log.addHandler(fileHandler)
+
+    consoleHandler = logging.StreamHandler()
+    log.addHandler(consoleHandler)
+
+def get_current_public_ip(cfg):
+    ret = None
+    log = logging.getLogger()
+    log.debug("Get current Livebox public IP")
+    lb = Lbws(cfg['livebox']['url'], cfg['livebox']['user'], cfg['livebox']['password'])
+    log.debug("IPV4 Publique : {0}".format(lb.wan_status.IPAddress))
+    if not is_ip(lb.wan_status.IPAddress):
+        log.debug("Error : Livebox public IP is not a valid IP : {0}".format(lb.wan_status.IPAddress))
+        return ret
+    
+    log.debug("Livebox public IP is valid")
+    ret = lb.wan_status.IPAddress
+    lb.logout()
+
+    return ret
+
+def get_current_dns_ip(cfg):
+    ret = None
+    log = logging.getLogger()
+
+    gandi_api = "https://dns.api.gandi.net/api/v5/domains/{0}/records/{1}/{2}".format(
+                    cfg['gandi']['domain'],
+                    cfg['gandi']['record_name'],
+                    cfg['gandi']['record_type'])
+
+    log.debug("Get current IP from Gandi")
+    req = requests.get(gandi_api, headers={'X-Api-Key': cfg['gandi']['key']})
+    if not req:
+        log.debug("Error retrieving current record from gandi")
+        return ret
+
+    json_data = json.loads(req.text)
+    gandi_rrset = json_data['rrset_values'][0]
+    if not is_ip(gandi_rrset):
+        log.debug("Error : Gandi rrset IP is not a valid IP : {0}".fornat(gandi_rrset))
+        return ret
+    log.debug("Gandi rrset IP is valid")
+    log.debug("Current rrset : {0}".format(gandi_rrset))
+
+    ret = gandi_rrset
+
+    return ret
+
+def update_dns_ip(cfg, ipaddr):
+    ret = True
+    log = logging.getLogger()
+
+    gandi_api = "https://dns.api.gandi.net/api/v5/domains/{0}/records/{1}/{2}".format(
+                    cfg['gandi']['domain'],
+                    cfg['gandi']['record_name'],
+                    cfg['gandi']['record_type'])
+
+    log.debug("Updating IP to Gandi")
+    payload = json.dumps({"rrset_values": [ipaddr]})
+    req = requests.put(gandi_api, headers={"Content-Type" : "application/json", "X-Api-Key": cfg['gandi']['key']}, data=payload)
+    if req:
+        log.debug("Update successful")
+    else:
+        log.error("Error : Error message while updating")
+        log.error(req.text)
+        ret = False
+
+    return ret
+
+def main_process(cfg):
+    log = logging.getLogger()
+    log.info('Start checking IP')
+
+    # Get current public IP
+    current_ip = get_current_public_ip(cfg)
+    if not current_ip:
+        log.error("Error retrieving current public IP")
+        sys.exit(2)
+    log.info('Current public IP is : {}'.format(current_ip))
+
+    # Get actual DNS IP from gandi
+    dns_ip = get_current_dns_ip(cfg)
+    if not dns_ip:
+        log.error("Error retrieving DNS public IP")
+        sys.exit(2)
+    log.info('Current DNS IP is : {}'.format(dns_ip))
+
+    log.debug("Comparing IPs")
+    if current_ip == dns_ip:
+        log.info("Gandi is up to date, nothing to update")
+    else:
+        log.info("Updating Gandi")
+        if update_dns_ip(cfg, current_ip):
+            log.info('IP succesfully updated')
+        else:
+            log.error('Error during updating')
+    log.info('End checking IP')
+
+def parse_args():
+    description = 'Update Gandi DNS with current public IP. Need a config file in the same directory named \n' + pathlib.Path(__file__).name + '.ini' 
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument('-V', '--version', action='version', version='%(prog)s v' + VERSION)
+    parser.add_argument('-L', '--log', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], default='INFO', help='Change logging level, default INFO')
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('-R', '--logrotatefile', action='store_true', help='Print logrotate file example, can be redirected to a file')
+    group.add_argument('-C', '--sampleconfig', action='store_true', help='Print sample config file, can be redirected to a file')
+    group.add_argument('-D', '--dnsip', action='store_true', help='Get current IP registered in DNS')
+    group.add_argument('-I', '--currentip', action='store_true', help='Get current public IP')
+    return parser.parse_args()
+
+def print_logrotatefile(log_file):
+    lr_file = str(log_file) + '''
+{
+        rotate 4
+        weekly
+        missingok
+        notifempty
+        compress
+        delaycompress
+        sharedscripts
+        endscript
+}'''
+    print(lr_file)
+
+def print_sampleconfig():
+    sample_cfg = '''[livebox]
+url = <livebox's IP>
+user = admin
+password = <admin password>
+
+[gandi]
+key = <Your gandi key>
+domain = <your domain>
+record_name = <your public record in domain>
+record_type = A'''
+    print(sample_cfg)
+
+def main():
+    prog = pathlib.Path(__file__)
+    progname = prog.name
+    prefix = prog.resolve().parent
+    cfg_file = (prefix / progname).with_suffix('.ini')
+    log_dir = pathlib.Path('/var/log')
+    log_file = (log_dir / progname).with_suffix('.log')
+
+    # Logging init
+
+    args = parse_args()
+    init_logger(log_file, log_level=args.log)
+    log = logging.getLogger()
+
+    if args.logrotatefile:
+        print_logrotatefile(log_file)
+        sys.exit(0)
+    if args.sampleconfig:
+        print_sampleconfig()
+        sys.exit(0)
+
+    log.debug('Using log file : {}'.format(log_file))
+    # Loading config
+    log.debug('Using config file : {}'.format(cfg_file))
+
+    if not cfg_file.is_file():
+        log.error('Config file {} does not exists'.format(cfg_file))
+        sys.exit(2)
+
+    config = configparser.ConfigParser()
+    config.read([str(cfg_file)])
+
+    if not check_config(config):
+        log.error('Config file does not have required sections/options')
+        sys.exit(2)
+
+    if args.dnsip:
+        log.info('IP registered in DNS : {}'.format(get_current_dns_ip(config)))
+        sys.exit(0)
+
+    if args.currentip:
+        log.info('Current public IP : {}'.format(get_current_public_ip(config)))
+        sys.exit(0)
+        
+    main_process(config)
+
+if __name__ == '__main__':
+    VERSION = "1.0.0"
+    main()
+    sys.exit(0)
